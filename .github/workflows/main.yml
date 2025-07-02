@@ -1,0 +1,140 @@
+name: Apple Music ALAC Downloader
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 每天UTC时间3点运行
+  push:
+    
+  workflow_dispatch:
+    inputs:
+      album_url:
+        description: 'Apple Music Album URL (e.g. https://music.apple.com/album/123456789)'
+        required: true
+
+env:
+  ANDROID_HOME: /home/runner/Android
+  FRIDA_VERSION: "16.0.8"
+
+jobs:
+  setup-environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget unzip openjdk-17-jdk \
+            python3-pip qemu-kvm libvirt-daemon-system git golang
+          sudo usermod -aG kvm $USER
+          sudo chmod 777 /dev/kvm
+
+      - name: Setup Android SDK
+        run: |
+          mkdir -p $ANDROID_HOME
+          wget https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O $ANDROID_HOME/cmdline-tools.zip
+          unzip $ANDROID_HOME/cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools
+          mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          yes | sdkmanager --licenses
+
+      - name: Install Android components
+        run: |
+          sdkmanager "platform-tools" "emulator"
+          sdkmanager "system-images;android-33;google_apis;x86_64"
+          avdmanager create avd -n "AppleMusicAVD" -k "system-images;android-33;google_apis;x86_64" -d pixel_4 --force
+
+      - name: Install Frida tools
+        run: pip3 install frida-tools
+
+  download-music:
+    needs: setup-environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone alacleaker/downloader
+        run: |
+          git clone https://github.com/alacleaker/apple-music-alac-downloader.git
+          cd apple-music-alac-downloader
+          git submodule update --init --recursive
+
+      - name: Start emulator
+        run: |
+          emulator -avd AppleMusicAVD -writable-system -no-snapshot-load -no-audio -no-window -gpu swiftshader_indirect &
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do
+            sleep 5
+            echo "Waiting for emulator boot..."
+          done
+          adb root
+          adb remount
+
+      - name: Install Apple Music APK
+        run: |
+          adb install -t -g apple-music-alac-downloader/apple-music.apk
+          adb shell am start -n com.apple.android.music/com.apple.android.music.MainActivity
+          sleep 15
+
+      - name: Setup Frida server
+        run: |
+          wget https://github.com/frida/frida/releases/download/$FRIDA_VERSION/frida-server-$FRIDA_VERSION-android-x86.xz
+          unxz frida-server-$FRIDA_VERSION-android-x86.xz
+          adb push frida-server-$FRIDA_VERSION-android-x86 /data/local/tmp/frida-server
+          adb shell "chmod 755 /data/local/tmp/frida-server"
+          adb shell "/data/local/tmp/frida-server &" &
+          adb forward tcp:10020 tcp:10020
+          sleep 5
+
+      - name: Run Frida agent
+        run: |
+          cd apple-music-alac-downloader
+          nohup frida -U -l agent.js -f com.apple.android.music > frida.log 2>&1 &
+          sleep 15
+          if ! frida-ps -U | grep -q "com.apple.android.music"; then
+            echo "::error::Frida injection failed!"
+            cat frida.log
+            exit 1
+          fi
+
+      - name: Execute download
+        run: |
+          cd apple-music-alac-downloader
+          ALBUM_URL="${{ github.event.inputs.album_url || secrets.DOWNLOAD_URL }}"
+          echo "Downloading album: $ALBUM_URL"
+          
+          # Clean URL format
+          CLEAN_URL=$(echo "$ALBUM_URL" | sed -E 's|(https?://[^/]+/).*/(album|playlist)/[^/]+/([0-9]+).*|\1\2/\3|')
+          
+          # Run with timeout and retry
+          timeout 1800 go run main.go "$CLEAN_URL" || {
+            echo "::warning::First attempt failed, retrying..."
+            pkill -f "frida.*android.music"
+            nohup frida -U -l agent.js -f com.apple.android.music > frida.log 2>&1 &
+            sleep 15
+            timeout 1800 go run main.go "$CLEAN_URL"
+          }
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: apple-music-alac
+          path: apple-music-alac-downloader/downloads/
+          retention-days: 7
+
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          echo "=== Emulator Status ==="
+          adb devices -l
+          echo "=== Frida Processes ==="
+          frida-ps -U
+          echo "=== Apple Music Logs ==="
+          adb logcat -d | grep -i "AppleMusic" | tail -n 50
+          echo "=== Frida Agent Log ==="
+          cat apple-music-alac-downloader/frida.log
