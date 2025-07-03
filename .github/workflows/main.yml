@@ -132,7 +132,7 @@ jobs:
 
       - name: Upload artifacts
         if: success()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: apple-music-alac
           path: apple-music-alac-downloader/downloads/
